@@ -31,6 +31,10 @@ version: no AWS, local backend. Exercised by
 - **Private module sources.** Git gets the token through `GIT_CONFIG_*` env
   on `terraform init` only. Nothing is written to `~/.gitconfig`, which
   replaces the `insteadOf --global` + `if: always()` cleanup pattern.
+- **`CONFIG_SKIP` hands a file to the caller.** CI then uses the caller's
+  copy unchecked. trivy's `severity` is an exact list, so a local copy that
+  swaps `HIGH` for `MEDIUM` hides every HIGH finding. Callers should give the
+  platform team CODEOWNERS on their `mise.toml` and scanner configs.
 - **Caller must grant permissions.** A reusable workflow can only narrow
   them. A caller that grants less fails before any job starts.
 - **Scans gate PRs, not applies.** Enforce the plan job as a required status
