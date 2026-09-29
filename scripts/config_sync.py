@@ -35,14 +35,20 @@ IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 class SyncError(Exception):
-    pass
+    def __init__(self, msg, file=None, line=None):
+        super().__init__(msg)
+        self.file, self.line = file, line
 
 
-def error(msg, file=None):
+def error(msg, file=None, line=None):
+    first, *rest = msg.splitlines()
     if IN_ACTIONS:
-        loc = f" file={file}" if file else ""
-        print(f"::error{loc}::{msg.splitlines()[0]}")
-    print(f"error: {msg}", file=sys.stderr)
+        loc = ",".join(f"{k}={v}" for k, v in (("file", file), ("line", line)) if v)
+        print(f"::error {loc}::{first}" if loc else f"::error::{first}")
+    else:
+        print(f"error: {first}")
+    for r in rest:
+        print(r)
 
 
 def pinned_ref(repo_root, env, profile):
@@ -56,26 +62,31 @@ def pinned_ref(repo_root, env, profile):
         for lineno, line in enumerate(stub.read_text().splitlines(), 1):
             m = USES_RE.match(line)
             if m:
-                found[f"{stub.relative_to(repo_root)}:{lineno}"] = (m["repo"], m["ref"])
+                found[(str(stub.relative_to(repo_root)), lineno)] = (m["repo"], m["ref"])
     if not found:
         raise SyncError(
             f"no stub for '{env}' calls {SHARED_REPO_NAME} "
             f"(looked for {', '.join('.github/workflows/' + n for n in names)})"
         )
-    for stub, (_, ref) in found.items():
+    for (stub, lineno), (_, ref) in found.items():
         if not SHA_RE.match(ref):
-            raise SyncError(f"{stub} pins '@{ref}', not a 40-character commit SHA")
+            raise SyncError(f"{stub}:{lineno} pins '@{ref}', not a 40-character commit SHA", stub, lineno)
     if len(set(found.values())) > 1:
-        lines = "\n".join(f"  {s}: {r}@{ref}" for s, (r, ref) in found.items())
-        raise SyncError(f"stubs for '{env}' pin different versions:\n{lines}")
+        lines = "\n".join(f"  {s}:{n}: {r}@{ref}" for (s, n), (r, ref) in found.items())
+        (stub, lineno), *_ = found
+        raise SyncError(f"stubs for '{env}' pin different versions:\n{lines}", stub, lineno)
     return next(iter(found.values()))
 
 
 def skip_list(repo_root, env_dir):
-    skip = set()
-    for cfg in (repo_root / "mise.toml", env_dir / "mise.toml"):
+    """Map each CONFIG_SKIP entry to the (file, line) that lists it."""
+    skip = {}
+    for cfg in dict.fromkeys((repo_root / "mise.toml", env_dir / "mise.toml")):
         if cfg.exists():
-            skip.update(tomllib.loads(cfg.read_text()).get("_", {}).get("CONFIG_SKIP", []))
+            text = cfg.read_text()
+            line = next((i for i, l in enumerate(text.splitlines(), 1) if l.strip().startswith("CONFIG_SKIP")), None)
+            for name in tomllib.loads(text).get("_", {}).get("CONFIG_SKIP", []):
+                skip[name] = (str(cfg.relative_to(repo_root)), line)
     return skip
 
 
@@ -132,11 +143,11 @@ def main():
 
     files = shared_files(args.profile, repo, sha, args.source_dir)
     skip = skip_list(repo_root, env_dir)
-    unknown = skip - files.keys()
+    unknown = sorted(skip.keys() - files.keys())
     if unknown:
-        raise SyncError(f"CONFIG_SKIP names files the shared repo does not provide: {', '.join(sorted(unknown))}")
+        raise SyncError(f"CONFIG_SKIP names files the shared repo does not provide: {', '.join(unknown)}", *skip[unknown[0]])
 
-    problems = []
+    problems = 0
     for name, upstream in files.items():
         local = env_dir / name
         rel = local.relative_to(repo_root)
@@ -149,14 +160,17 @@ def main():
             local.chmod(0o644)
             print(f"wrote    {rel}")
         elif not local.exists():
-            problems.append((rel, "missing", None))
+            problems += 1
+            error(f"{rel} missing (vendored from {repo}@{sha[:12]})", str(rel))
         elif normalise(local.read_bytes()) != want:
-            diff = difflib.unified_diff(
+            problems += 1
+            diff = list(difflib.unified_diff(
                 want.decode(errors="replace").splitlines(),
                 normalise(local.read_bytes()).decode(errors="replace").splitlines(),
                 f"{repo}@{sha[:12]}:configs/{args.profile}/{name}", str(rel), lineterm="", n=1,
-            )
-            problems.append((rel, "differs", "\n".join(list(diff)[:40])))
+            ))
+            hunk = next((re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", d) for d in diff if d.startswith("@@")), None)
+            error(f"{rel} differs from {repo}@{sha[:12]}\n" + "\n".join(diff[:40]), str(rel), hunk and hunk.group(1))
         else:
             print(f"ok       {rel}")
 
@@ -164,16 +178,13 @@ def main():
         is_root = env_dir == repo_root
         task = "mise run config:sync" + ("" if is_root else f" {env}")
         mise_toml = "mise.toml" if is_root else f"{env}/mise.toml"
-        for rel, kind, diff in problems:
-            error(f"{rel} {kind} from {repo}@{sha[:12]}" + (f"\n{diff}" if diff else ""), file=str(rel))
         print(
-            f"\n{len(problems)} vendored config file(s) do not match the version the '{env}' stubs pin.\n"
+            f"\n{problems} vendored config file(s) do not match the version the '{env}' stubs pin.\n"
             f"Fix: run `{task}` and commit the result.\n"
-            f"To own a file locally instead, add it to CONFIG_SKIP under [_] in {mise_toml}.",
-            file=sys.stderr,
+            f"To own a file locally instead, add it to CONFIG_SKIP under [_] in {mise_toml}."
         )
         return 1
-    print(f"{args.mode}: {env} matches {repo}@{sha[:12]} ({len(files) - len(skip & files.keys())} files, {len(skip)} skipped)")
+    print(f"{args.mode}: {env} matches {repo}@{sha[:12]} ({len(files) - len(skip.keys() & files.keys())} files, {len(skip)} skipped)")
     return 0
 
 
@@ -181,5 +192,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except SyncError as e:
-        error(str(e))
+        error(str(e), e.file, e.line)
         sys.exit(1)
