@@ -1,145 +1,242 @@
-name: terraform-deploy
+name: Deploy
 
 on:
   workflow_call:
     inputs:
-      working-directory:
-        description: Top-level env directory; also the environment name.
-        type: string
+      deploy-env:
+        description: Environment directory, also the GitHub environment name, e.g. prod.
         required: true
-      plan-artifact:
-        description: The plan job's plan-artifact output.
         type: string
-        required: true
-      aws-role-arn:
-        description: Role to assume. Empty assumes nothing.
-        type: string
+      action:
+        description: The caller's workflow_dispatch action (plan or apply). Ignored on push and pull_request.
         required: false
+        type: string
+        default: plan
+      aws-account-id:
+        description: AWS account to deploy to. Empty skips AWS credentials, for testing without AWS.
+        required: false
+        type: string
         default: ""
       aws-region:
-        type: string
         required: false
-        default: eu-central-1
-      client-id:
         type: string
+        default: eu-central-2
+      aws-deploy-role:
         required: false
-        default: ""
+        type: string
+        default: acme-github-deploy
     secrets:
-      app-private-key:
+      GITHUBMCH_REPOS_READ_APP_PRIVATE_KEY:
+        required: true
+      TFC_REGISTRY_READ_TOKEN:
         required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+  AWS_REGION: ${{ inputs.aws-region }}
+  AWS_DEPLOY_ROLE: ${{ inputs.aws-deploy-role }}
+  DEPLOY_ENV: ${{ inputs.deploy-env }}
+  TF_ACTION: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')) && 'apply' || 'plan' }}
 
 jobs:
-  apply:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    environment: ${{ inputs.working-directory }}
+  deploy:
+    name: Deploy ${{ inputs.deploy-env }}
+    environment:
+      name: ${{ inputs.deploy-env }}
+      deployment: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
-    concurrency:
-      group: terraform-${{ inputs.working-directory }}-${{ github.ref }}
-      cancel-in-progress: false # the default is true; a cancelled run can leave a state lock
-    defaults:
-      run:
-        shell: bash
-        working-directory: ${{ inputs.working-directory }}
-    env:
-      TF_IN_AUTOMATION: "1"
-      TF_INPUT: "0"
+      id-token: write       # OIDC for AWS credentials
+      pull-requests: write  # Terraform plan as PR comment
+
     steps:
-      # A failing step, not a job-level if: a skipped job shows green.
-      - name: Require main
-        working-directory: .
+      - name: Require main for apply
+        if: env.TF_ACTION == 'apply' && github.ref != 'refs/heads/main'
         run: |
-          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
-            echo "::error::apply runs only on refs/heads/main, got $GITHUB_REF ($GITHUB_EVENT_NAME)"
-            exit 1
-          fi
+          echo "::error::apply runs only on main, got $GITHUB_REF"
+          exit 1
 
-      # Same bootstrap in all three workflows; composites only exist after the .shared checkout.
-      - name: Validate inputs
-        working-directory: .
-        env:
-          WORKDIR: ${{ inputs.working-directory }}
-          CLIENT_ID: ${{ inputs.client-id }}
-          HAS_KEY: ${{ secrets.app-private-key != '' }}
-          SHARED_SHA: ${{ job.workflow_sha }}
-        run: |
-          if [[ ! "$SHARED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::job.workflow_sha is empty or malformed ('$SHARED_SHA'); cannot check out this shared repo at its own SHA"
-            exit 1
-          fi
-          if [[ ! "$WORKDIR" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            echo "::error::working-directory must be a top-level directory name (it doubles as the environment name), got '$WORKDIR'"
-            exit 1
-          fi
-          if [[ -z "$CLIENT_ID" || "$HAS_KEY" != true ]]; then
-            echo "::error::client-id input and app-private-key secret are required to read the shared repo"
-            exit 1
-          fi
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-      - id: app-token
+      - name: Install tools with mise
+        uses: jdx/mise-action@c1ecc8f748cd28cdeabf76dab3cccde4ce692fe4 # v4.0.0
+        with:
+          version: 2026.3.4
+          working_directory: ${{ env.DEPLOY_ENV }}
+
+      - name: Generate GitHub App Token
+        id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ inputs.client-id }}
-          private-key: ${{ secrets.app-private-key }}
-          owner: ${{ github.repository_owner }}
-          # No repositories: list. The token reads whatever the App is installed on.
+          client-id: ${{ vars.GITHUBMCH_REPOS_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GITHUBMCH_REPOS_READ_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }} # zizmor: ignore[github-app] read-only token for private module sources org-wide, by decision
           permission-contents: read
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - name: Configure git credentials for GitHub module refs
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${APP_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          token: ${{ steps.app-token.outputs.token }}
-          path: .shared
-          persist-credentials: false
+      - name: terraform fmt
+        id: fmt
+        run: terraform fmt -check -diff -recursive
 
-      - name: OIDC claims
-        uses: ./.shared/.github/actions/oidc-claims
-        with:
-          label: apply (${{ github.event_name }}, environment ${{ inputs.working-directory }})
+      - name: terraform-docs
+        id: docs
+        working-directory: ${{ env.DEPLOY_ENV }}/
+        run: terraform-docs . --output-check
 
-      - id: tools
-        uses: ./.shared/.github/actions/setup-tools
-        with:
-          working-directory: ${{ inputs.working-directory }}
+      - name: Vendored config check
+        id: configs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHARED_REPO: ${{ job.workflow_repository }}
+          SHARED_SHA: ${{ job.workflow_sha }}
+        run: |
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/${SHARED_REPO}/contents/scripts/config_sync.py?ref=${SHARED_SHA}" > "$RUNNER_TEMP/config_sync.py"
+          mise x python@3.12 -- python3 "$RUNNER_TEMP/config_sync.py" check \
+            --env-dir "$DEPLOY_ENV" --expect-sha "$SHARED_SHA"
 
-      - name: AWS credentials
-        if: inputs.aws-role-arn != ''
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.aws-role-arn }}
-          aws-region: ${{ inputs.aws-region }}
-          role-session-name: apply-${{ inputs.working-directory }}-${{ github.run_id }}
+      - name: TFLint
+        id: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        working-directory: ${{ env.DEPLOY_ENV }}/
+        run: |
+          tflint --init
+          tflint
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Configure AWS credentials
+        if: env.AWS_ACCOUNT_ID != ''
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
-          name: ${{ inputs.plan-artifact }}
-          path: ${{ inputs.working-directory }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.AWS_DEPLOY_ROLE }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: terraform init
+        id: init
+        working-directory: ${{ env.DEPLOY_ENV }}/
         env:
-          # The token reaches git via env on this step only. Nothing is written to ~/.gitconfig.
-          GIT_CONFIG_COUNT: "2"
-          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
-          GIT_CONFIG_VALUE_0: https://github.com/${{ github.repository_owner }}/
-          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
-          GIT_CONFIG_VALUE_1: git@github.com:${{ github.repository_owner }}/
-        run: terraform init -no-color -lockfile=readonly
+          # Used for fetching modules from the private Terraform registry
+          TF_TOKEN_app_terraform_io: ${{ secrets.TFC_REGISTRY_READ_TOKEN }}
+        run: terraform init -input=false
+
+      - name: terraform plan
+        id: plan
+        if: env.TF_ACTION == 'plan'
+        working-directory: ${{ env.DEPLOY_ENV }}/
+        run: terraform plan -input=false -out=tfplan
 
       - name: terraform apply
-        run: |
-          set -o pipefail
-          terraform apply -no-color tfplan | tee apply.txt
+        id: apply
+        if: env.TF_ACTION == 'apply'
+        working-directory: ${{ env.DEPLOY_ENV }}/
+        run: terraform apply -input=false -auto-approve
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+      # Nothing past this point touches AWS: drop the deploy role's session
+      # before running any plan reporting or scanning steps below.
+      - name: Drop AWS credentials
+        run: |
+          {
+            echo "AWS_ACCESS_KEY_ID="
+            echo "AWS_SECRET_ACCESS_KEY="
+            echo "AWS_SESSION_TOKEN="
+            echo "AWS_REGION="
+            echo "AWS_DEFAULT_REGION="
+          } >> "$GITHUB_ENV"
+
+      - name: Post plan comment
+        id: comment
+        if: env.TF_ACTION == 'plan' && github.event_name == 'pull_request'
+        uses: borchero/terraform-plan-comment@d177dfb833ccfb6ef6022700796190dfe54830f1 # v3.0.0
         with:
-          name: apply-${{ inputs.working-directory }}-${{ github.run_attempt }}
-          if-no-files-found: ignore
-          path: ${{ inputs.working-directory }}/apply.txt
+          token: ${{ github.token }}
+          planfile: tfplan
+          working-directory: ${{ env.DEPLOY_ENV }}/
+          header: "📝 Terraform Plan: ${{ env.DEPLOY_ENV }}"
+
+      - name: Trivy plan scan
+        id: trivy
+        if: env.TF_ACTION == 'plan'
+        working-directory: ${{ env.DEPLOY_ENV }}/
+        run: >-
+          trivy config
+          --config trivy.yaml
+          --ignorefile .trivyignore
+          tfplan
+
+      - name: Checkov plan scan
+        id: checkov
+        if: env.TF_ACTION == 'plan'
+        working-directory: ${{ env.DEPLOY_ENV }}/
+        env:
+          # Let Checkov recover #checkov:skip comments that live inside a called
+          # module. Checkov ignores dot-directories by default, and also
+          # hardcodes .terraform (where module source lives) in its ignore list.
+          # Disable both, keeping the rest of the default ignore list as is.
+          CHECKOV_EXPERIMENTAL_TERRAFORM_MANAGED_MODULES: true
+          CKV_IGNORE_HIDDEN_DIRECTORIES: false
+          CKV_IGNORED_DIRECTORIES: "node_modules,.serverless"
+        run: |
+          terraform show -json tfplan > tfplan.json
+          checkov \
+            --config-file .checkov.yml \
+            --repo-root-for-plan-enrichment . \
+            -f tfplan.json
+
+      - name: Remove git credentials
+        if: always()
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config --global --get-regexp '^url\.https://x-access-token:' >/dev/null || exit 0
+          git config --global --remove-section "url.https://x-access-token:${APP_TOKEN}@github.com/"
+
+      - name: Step summary
+        if: always()
+        env:
+          FMT: ${{ steps.fmt.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
+          CONFIGS: ${{ steps.configs.outcome }}
+          TFLINT: ${{ steps.tflint.outcome }}
+          INIT: ${{ steps.init.outcome }}
+          PLAN: ${{ steps.plan.outcome }}
+          APPLY: ${{ steps.apply.outcome }}
+          COMMENT: ${{ steps.comment.outcome }}
+          TRIVY: ${{ steps.trivy.outcome }}
+          CHECKOV: ${{ steps.checkov.outcome }}
+        run: |
+          {
+            echo "### Deploy ${DEPLOY_ENV}: ${TF_ACTION}"
+            echo
+            echo "| check | result |"
+            echo "|---|---|"
+            echo "| terraform fmt | ${FMT:-not run} |"
+            echo "| terraform-docs | ${DOCS:-not run} |"
+            echo "| vendored configs | ${CONFIGS:-not run} |"
+            echo "| TFLint | ${TFLINT:-not run} |"
+            echo "| terraform init | ${INIT:-not run} |"
+            echo "| terraform plan | ${PLAN:-not run} |"
+            echo "| terraform apply | ${APPLY:-not run} |"
+            echo "| plan comment | ${COMMENT:-not run} |"
+            echo "| Trivy | ${TRIVY:-not run} |"
+            echo "| Checkov | ${CHECKOV:-not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"

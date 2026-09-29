@@ -23,8 +23,8 @@ except ModuleNotFoundError:
 
 SHARED_REPO_NAME = "acme-iacplatform-githubworkflows"
 STUBS = {
-    "deploy": ("terraform-{env}.yml",),
-    "module": ("module-ci.yml",),
+    "deploy": ("deploy-{env}.yml",),
+    "module": ("ci.yml",),
 }
 USES_RE = re.compile(
     r"^\s*uses:\s*(?P<repo>[\w.-]+/" + re.escape(SHARED_REPO_NAME) + r")"

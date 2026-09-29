@@ -1,140 +1,142 @@
-name: terraform-module-ci
+name: CI
 
 on:
   workflow_call:
-    inputs:
-      client-id:
-        description: GitHub App that reads this repo and private module sources.
-        type: string
-        required: false
-        default: ""
     secrets:
-      app-private-key:
+      GITHUBMCH_REPOS_READ_APP_PRIVATE_KEY:
+        required: true
+      TFC_REGISTRY_READ_TOKEN:
         required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  module-ci:
-    runs-on: ubuntu-24.04
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
-    concurrency:
-      group: terraform-module-ci-${{ github.ref }}
-      cancel-in-progress: true
-    defaults:
-      run:
-        shell: bash
-    env:
-      TF_IN_AUTOMATION: "1"
-      TF_INPUT: "0"
-    steps:
-      # Same bootstrap in all three workflows; composites only exist after the .shared checkout.
-      - name: Validate inputs
-        env:
-          CLIENT_ID: ${{ inputs.client-id }}
-          HAS_KEY: ${{ secrets.app-private-key != '' }}
-          SHARED_SHA: ${{ job.workflow_sha }}
-        run: |
-          if [[ ! "$SHARED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::job.workflow_sha is empty or malformed ('$SHARED_SHA'); cannot check out this shared repo at its own SHA"
-            exit 1
-          fi
-          if [[ -z "$CLIENT_ID" || "$HAS_KEY" != true ]]; then
-            echo "::error::client-id input and app-private-key secret are required to read the shared repo"
-            exit 1
-          fi
 
-      - id: app-token
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install tools with mise
+        uses: jdx/mise-action@c1ecc8f748cd28cdeabf76dab3cccde4ce692fe4 # v4.0.0
+        with:
+          version: 2026.3.4
+
+      - name: Generate GitHub App Token
+        id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ inputs.client-id }}
-          private-key: ${{ secrets.app-private-key }}
-          owner: ${{ github.repository_owner }}
-          # No repositories: list. The token reads whatever the App is installed on.
+          client-id: ${{ vars.GITHUBMCH_REPOS_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GITHUBMCH_REPOS_READ_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }} # zizmor: ignore[github-app] read-only token for private module sources org-wide, by decision
           permission-contents: read
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          token: ${{ steps.app-token.outputs.token }}
-          path: .shared
-          persist-credentials: false
-
-      - id: tools
-        uses: ./.shared/.github/actions/setup-tools
-        with:
-          working-directory: .
-          required-tools: terraform tflint trivy terraform-docs
-
-      - id: modules
-        name: Find modules
+      - name: Configure git credentials for GitHub module refs
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          mapfile -t dirs < <(find modules -mindepth 1 -maxdepth 1 -type d -exec sh -c 'ls "$1"/*.tf >/dev/null 2>&1' _ {} \; -print 2>/dev/null | sort)
-          if (( ${#dirs[@]} == 0 )); then
-            echo "::error::no modules found: expected modules/<name>/*.tf"
-            exit 1
-          fi
-          printf '%s\n' "${dirs[@]}"
-          echo "dirs=${dirs[*]}" >> "$GITHUB_OUTPUT"
+          git config --global \
+            url."https://x-access-token:${APP_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: mise.toml fmt
+        id: mise-fmt
+        run: mise fmt --check
 
       - name: terraform fmt
-        run: terraform fmt -check -diff -recursive modules
+        id: fmt
+        run: terraform fmt -check -diff -recursive
 
-      - name: terraform init, validate, test
-        env:
-          DIRS: ${{ steps.modules.outputs.dirs }}
-          # The token reaches git via env on this step only. Nothing is written to ~/.gitconfig.
-          GIT_CONFIG_COUNT: "2"
-          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
-          GIT_CONFIG_VALUE_0: https://github.com/${{ github.repository_owner }}/
-          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
-          GIT_CONFIG_VALUE_1: git@github.com:${{ github.repository_owner }}/
-        run: |
-          failed=()
-          for d in $DIRS; do
-            echo "::group::$d"
-            ( cd "$d" \
-              && terraform init -no-color -backend=false \
-              && terraform validate -no-color \
-              && terraform test -no-color ) || failed+=("$d")
-            echo "::endgroup::"
-          done
-          if (( ${#failed[@]} )); then
-            echo "::error::init/validate/test failed in: ${failed[*]}"
-            exit 1
-          fi
-
-      - name: tflint
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
-        run: tflint --recursive --config "$PWD/.tflint.hcl" --format compact
-
-      - name: terraform-docs up to date
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
-        env:
-          DIRS: ${{ steps.modules.outputs.dirs }}
-        run: |
-          failed=()
-          for d in $DIRS; do
-            terraform-docs --config "$PWD/.terraform-docs.yml" --output-check "$d" || failed+=("$d")
-          done
-          if (( ${#failed[@]} )); then
-            echo "::error::README.md out of date in: ${failed[*]}. Run: terraform-docs --config .terraform-docs.yml <module dir>"
-            exit 1
-          fi
-
-      - name: trivy (source)
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
-        run: trivy config --config trivy.yaml modules
+      - name: terraform-docs
+        id: docs
+        run: terraform-docs . --output-check
 
       - name: Vendored config check
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
-        uses: ./.shared/.github/actions/config-check
-        with:
-          working-directory: .
-          profile: module
-          shared-sha: ${{ job.workflow_sha }}
+        id: configs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHARED_REPO: ${{ job.workflow_repository }}
+          SHARED_SHA: ${{ job.workflow_sha }}
+        run: |
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/${SHARED_REPO}/contents/scripts/config_sync.py?ref=${SHARED_SHA}" > "$RUNNER_TEMP/config_sync.py"
+          mise x python@3.12 -- python3 "$RUNNER_TEMP/config_sync.py" check --profile module \
+            --env-dir . --expect-sha "$SHARED_SHA"
+
+      - name: TFLint
+        id: tflint
+        run: |
+          tflint --init
+          tflint --recursive --config "$(pwd)/.tflint.hcl"
+
+      - name: Trivy IaC scan
+        id: trivy
+        run: trivy config .
+
+      - name: Checkov
+        id: checkov
+        run: checkov -d . --config-file .checkov.yml
+
+      - name: terraform init
+        id: init
+        env:
+          # Used for fetching modules from the private Terraform registry
+          TF_TOKEN_app_terraform_io: ${{ secrets.TFC_REGISTRY_READ_TOKEN }}
+        run: terraform init -input=false
+
+      - name: terraform validate
+        id: validate
+        run: terraform validate
+
+      - name: terraform test
+        id: test
+        run: terraform test
+
+      - name: Remove git credentials
+        if: always()
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config --global --get-regexp '^url\.https://x-access-token:' >/dev/null || exit 0
+          git config --global --remove-section "url.https://x-access-token:${APP_TOKEN}@github.com/"
+
+      - name: Step summary
+        if: always()
+        env:
+          MISE_FMT: ${{ steps.mise-fmt.outcome }}
+          FMT: ${{ steps.fmt.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
+          CONFIGS: ${{ steps.configs.outcome }}
+          TFLINT: ${{ steps.tflint.outcome }}
+          TRIVY: ${{ steps.trivy.outcome }}
+          CHECKOV: ${{ steps.checkov.outcome }}
+          INIT: ${{ steps.init.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          TEST: ${{ steps.test.outcome }}
+        run: |
+          {
+            echo "### Module CI"
+            echo
+            echo "| check | result |"
+            echo "|---|---|"
+            echo "| mise.toml fmt | ${MISE_FMT:-not run} |"
+            echo "| terraform fmt | ${FMT:-not run} |"
+            echo "| terraform-docs | ${DOCS:-not run} |"
+            echo "| vendored configs | ${CONFIGS:-not run} |"
+            echo "| TFLint | ${TFLINT:-not run} |"
+            echo "| Trivy | ${TRIVY:-not run} |"
+            echo "| Checkov | ${CHECKOV:-not run} |"
+            echo "| terraform init | ${INIT:-not run} |"
+            echo "| terraform validate | ${VALIDATE:-not run} |"
+            echo "| terraform test | ${TEST:-not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
