@@ -11,7 +11,6 @@ version: no AWS, local backend. Exercised by
 | `.github/workflows/terraform-plan.yml` | `plan` job of a caller's `terraform-<env>.yml`. Every trigger: plan, then upload the plan artifact. PRs only: scans, vendored config check. No PR comment yet. No `environment:`. |
 | `.github/workflows/terraform-deploy.yml` | `apply` job: main only; `environment:` = working directory. Applies the plan job's artifact after approval, with `init -lockfile=readonly`. Never plans again. |
 | `.github/workflows/terraform-module-ci.yml` | Module repos: per module fmt, validate, `terraform test`, tflint, terraform-docs check, trivy, config check. No AWS. |
-| `.github/workflows/probe-*.yml` | Sandbox probes. Not part of the product. |
 | `.github/actions/*` | Composites, used from a checkout of this repo at `job.workflow_sha`. |
 | `configs/deploy/` | Vendored into deploy repo env dirs by `mise run config:sync <env>`. |
 | `configs/module/` | Vendored into module repo roots by `mise run config:sync`. Adds `.terraform-docs.yml`. |
