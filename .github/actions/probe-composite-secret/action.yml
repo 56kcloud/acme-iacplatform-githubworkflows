@@ -22,4 +22,5 @@ runs:
           while IFS= read -r line; do echo "  > $line"; done <<<"$MULTI"
         fi
     - shell: bash
-      run: echo "direct via expression (expect ***): ${{ inputs.secret-value }}"
+      run: |
+        echo "direct via expression (expect ***): ${{ inputs.secret-value }}"
