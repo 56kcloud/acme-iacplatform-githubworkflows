@@ -122,17 +122,6 @@ jobs:
           name: ${{ inputs.plan-artifact }}
           path: ${{ inputs.working-directory }}
 
-      - name: Plan being applied
-        env:
-          ARTIFACT: ${{ inputs.plan-artifact }}
-        run: |
-          {
-            echo "### Applying plan \`$ARTIFACT\`"
-            echo '```'
-            tail -n 60 plan.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
       - name: terraform init
         env:
           # The token reaches git via env on this step only. Nothing is written to ~/.gitconfig.

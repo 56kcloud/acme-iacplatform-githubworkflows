@@ -151,6 +151,18 @@ jobs:
             ${{ inputs.working-directory }}/plan.txt
             ${{ inputs.working-directory }}/.terraform.lock.hcl
 
+      # On the run page before the apply approval prompt.
+      - name: Plan summary
+        env:
+          ARTIFACT: ${{ steps.artifact.outputs.name }}
+        run: |
+          {
+            echo "### Plan \`$ARTIFACT\`"
+            echo '```'
+            tail -n 60 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: tflint
         if: ${{ !cancelled() && steps.tools.outcome == 'success' && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
         run: tflint --config "$PWD/.tflint.hcl" --format compact

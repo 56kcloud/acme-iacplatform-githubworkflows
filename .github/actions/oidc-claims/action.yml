@@ -17,7 +17,6 @@ runs:
       run: |
         if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
           echo "::warning::No OIDC token available: job lacks id-token: write"
-          echo "| $LABEL | _no id-token: write_ |" >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
         token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
@@ -28,10 +27,5 @@ runs:
         claims=$(base64 -d <<<"$payload" | jq -c '{sub, aud, ref, event_name, environment,
           workflow, workflow_ref, job_workflow_ref, job_workflow_sha,
           repository_id, repository_owner_id}')
+        echo "OIDC claims: $LABEL"
         echo "$claims" | jq .
-        {
-          echo "#### OIDC claims: $LABEL"
-          echo '```json'
-          echo "$claims" | jq .
-          echo '```'
-        } >> "$GITHUB_STEP_SUMMARY"
