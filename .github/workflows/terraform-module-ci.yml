@@ -3,7 +3,7 @@ name: terraform-module-ci
 on:
   workflow_call:
     inputs:
-      app-id:
+      client-id:
         description: GitHub App that reads this repo and private module sources.
         type: string
         required: false
@@ -31,7 +31,7 @@ jobs:
       # Same bootstrap in all three workflows; composites only exist after the .shared checkout.
       - name: Validate inputs
         env:
-          APP_ID: ${{ inputs.app-id }}
+          CLIENT_ID: ${{ inputs.client-id }}
           HAS_KEY: ${{ secrets.app-private-key != '' }}
           SHARED_SHA: ${{ job.workflow_sha }}
         run: |
@@ -39,15 +39,15 @@ jobs:
             echo "::error::job.workflow_sha is empty or malformed ('$SHARED_SHA'); cannot check out this shared repo at its own SHA"
             exit 1
           fi
-          if [[ -z "$APP_ID" || "$HAS_KEY" != true ]]; then
-            echo "::error::app-id input and app-private-key secret are required to read the shared repo"
+          if [[ -z "$CLIENT_ID" || "$HAS_KEY" != true ]]; then
+            echo "::error::client-id input and app-private-key secret are required to read the shared repo"
             exit 1
           fi
 
       - id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ inputs.app-id }}
+          client-id: ${{ inputs.client-id }}
           private-key: ${{ secrets.app-private-key }}
           owner: ${{ github.repository_owner }}
           # No repositories: list. The token reads whatever the App is installed on.
@@ -65,7 +65,8 @@ jobs:
           path: .shared
           persist-credentials: false
 
-      - uses: ./.shared/.github/actions/setup-tools
+      - id: tools
+        uses: ./.shared/.github/actions/setup-tools
         with:
           working-directory: .
           required-tools: terraform tflint trivy terraform-docs
@@ -109,11 +110,11 @@ jobs:
           fi
 
       - name: tflint
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: tflint --recursive --config "$PWD/.tflint.hcl" --format compact
 
       - name: terraform-docs up to date
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         env:
           DIRS: ${{ steps.modules.outputs.dirs }}
         run: |
@@ -127,11 +128,11 @@ jobs:
           fi
 
       - name: trivy (source)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: trivy config --config trivy.yaml modules
 
       - name: Vendored config check
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         uses: ./.shared/.github/actions/config-check
         with:
           working-directory: .

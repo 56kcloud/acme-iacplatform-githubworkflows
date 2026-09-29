@@ -7,7 +7,7 @@ on:
         description: Top-level env directory; also the environment name.
         type: string
         required: true
-      app-id:
+      client-id:
         description: GitHub App that reads this repo and private module sources.
         type: string
         required: false
@@ -55,7 +55,7 @@ jobs:
         working-directory: .
         env:
           WORKDIR: ${{ inputs.working-directory }}
-          APP_ID: ${{ inputs.app-id }}
+          CLIENT_ID: ${{ inputs.client-id }}
           HAS_KEY: ${{ secrets.app-private-key != '' }}
           SHARED_SHA: ${{ job.workflow_sha }}
         run: |
@@ -67,15 +67,15 @@ jobs:
             echo "::error::working-directory must be a top-level directory name (it doubles as the environment name), got '$WORKDIR'"
             exit 1
           fi
-          if [[ -z "$APP_ID" || "$HAS_KEY" != true ]]; then
-            echo "::error::app-id input and app-private-key secret are required to read the shared repo"
+          if [[ -z "$CLIENT_ID" || "$HAS_KEY" != true ]]; then
+            echo "::error::client-id input and app-private-key secret are required to read the shared repo"
             exit 1
           fi
 
       - id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ inputs.app-id }}
+          client-id: ${{ inputs.client-id }}
           private-key: ${{ secrets.app-private-key }}
           owner: ${{ github.repository_owner }}
           # No repositories: list. The token reads whatever the App is installed on.
@@ -98,7 +98,8 @@ jobs:
         with:
           label: plan (${{ github.event_name }}, no environment)
 
-      - uses: ./.shared/.github/actions/setup-tools
+      - id: tools
+        uses: ./.shared/.github/actions/setup-tools
         with:
           working-directory: ${{ inputs.working-directory }}
 
@@ -151,15 +152,15 @@ jobs:
             ${{ inputs.working-directory }}/.terraform.lock.hcl
 
       - name: tflint
-        if: ${{ !cancelled() && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
         run: tflint --config "$PWD/.tflint.hcl" --format compact
 
       - name: trivy (plan)
-        if: ${{ !cancelled() && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
         run: trivy config --config trivy.yaml tfplan.json
 
       - name: Vendored config check
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' && github.event_name == 'pull_request' }}
         uses: ./.shared/.github/actions/config-check
         with:
           working-directory: ${{ inputs.working-directory }}
