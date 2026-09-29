@@ -121,7 +121,9 @@ Callers commit copies, and the copies follow the SHA their stub pins:
 Both workflows:
 - are `workflow_call` workflows, still one job each;
 - take tool versions from the caller's `mise.toml` and pin the mise version
-  (2026.3.4) themselves. The deploy workflow runs mise in the env directory,
+  themselves: 2026.9.16, up from the templates' 2026.3.4, which can't install
+  trivy or checkov on GitHub-hosted runners (their orgs' IP allow lists reject
+  the job token with a 403). The deploy workflow runs mise in the env directory,
   so a per-env `mise.toml` wins over a root one;
 - run the tools directly, not the caller's mise tasks;
 - fail on `terraform fmt` and terraform-docs diffs, with no auto-fix commits.
