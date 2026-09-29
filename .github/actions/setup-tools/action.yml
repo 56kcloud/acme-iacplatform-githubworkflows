@@ -1,0 +1,53 @@
+name: setup-tools
+description: Install tools with mise for one directory, then verify what resolved.
+inputs:
+  working-directory:
+    description: Environment directory whose mise.toml (merged with parents) decides tool versions.
+    required: true
+  required-tools:
+    description: Space-separated commands that must be on PATH afterwards.
+    required: false
+    default: terraform tflint trivy
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      env:
+        MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      with:
+        version: 2026.9.16 # keep in step with callers' min_version
+        working_directory: ${{ inputs.working-directory }}
+
+    - name: Verify tools
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        REQUIRED_TOOLS: ${{ inputs.required-tools }}
+        WORKDIR: ${{ inputs.working-directory }}
+      run: |
+        # command -v alone passes on a bare mise shim; the version check below runs the tool.
+        missing=()
+        for t in $REQUIRED_TOOLS; do
+          command -v "$t" >/dev/null || missing+=("$t")
+        done
+        if (( ${#missing[@]} )); then
+          echo "::error::Required tools not on PATH after mise install: ${missing[*]}"
+          exit 1
+        fi
+
+        {
+          echo "### Resolved tools for \`$WORKDIR\`"
+          echo
+          echo "| tool | mise says | on PATH | path |"
+          echo "|---|---|---|---|"
+          for t in $REQUIRED_TOOLS; do
+            echo "| $t | $(mise current "$t" 2>/dev/null || echo '?') | $("$t" --version 2>/dev/null | head -1) | \`$(command -v "$t")\` |"
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        want=$(mise current terraform)
+        got=$(terraform version -json | jq -r .terraform_version)
+        if [[ "$want" != "$got" ]]; then
+          echo "::error::mise resolves terraform $want for $WORKDIR but PATH runs $got ($(command -v terraform))"
+          exit 1
+        fi

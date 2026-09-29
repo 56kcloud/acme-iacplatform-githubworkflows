@@ -1,0 +1,139 @@
+name: terraform-module-ci
+
+on:
+  workflow_call:
+    inputs:
+      app-id:
+        description: GitHub App that reads this repo and private module sources.
+        type: string
+        required: false
+        default: ""
+    secrets:
+      app-private-key:
+        required: false
+
+jobs:
+  module-ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: terraform-module-ci-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        shell: bash
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      # Same bootstrap in all three workflows; composites only exist after the .shared checkout.
+      - name: Validate inputs
+        env:
+          APP_ID: ${{ inputs.app-id }}
+          HAS_KEY: ${{ secrets.app-private-key != '' }}
+          SHARED_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [[ ! "$SHARED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha is empty or malformed ('$SHARED_SHA'); cannot check out this shared repo at its own SHA"
+            exit 1
+          fi
+          if [[ -z "$APP_ID" || "$HAS_KEY" != true ]]; then
+            echo "::error::app-id input and app-private-key secret are required to read the shared repo"
+            exit 1
+          fi
+
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          # No repositories: list. The token reads whatever the App is installed on.
+          permission-contents: read
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: .shared
+          persist-credentials: false
+
+      - uses: ./.shared/.github/actions/setup-tools
+        with:
+          working-directory: .
+          required-tools: terraform tflint trivy terraform-docs
+
+      - id: modules
+        name: Find modules
+        run: |
+          mapfile -t dirs < <(find modules -mindepth 1 -maxdepth 1 -type d -exec sh -c 'ls "$1"/*.tf >/dev/null 2>&1' _ {} \; -print 2>/dev/null | sort)
+          if (( ${#dirs[@]} == 0 )); then
+            echo "::error::no modules found: expected modules/<name>/*.tf"
+            exit 1
+          fi
+          printf '%s\n' "${dirs[@]}"
+          echo "dirs=${dirs[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: terraform fmt
+        run: terraform fmt -check -diff -recursive modules
+
+      - name: terraform init, validate, test
+        env:
+          DIRS: ${{ steps.modules.outputs.dirs }}
+          # The token reaches git via env on this step only. Nothing is written to ~/.gitconfig.
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/${{ github.repository_owner }}/
+          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
+          GIT_CONFIG_VALUE_1: git@github.com:${{ github.repository_owner }}/
+        run: |
+          failed=()
+          for d in $DIRS; do
+            echo "::group::$d"
+            ( cd "$d" \
+              && terraform init -no-color -backend=false \
+              && terraform validate -no-color \
+              && terraform test -no-color ) || failed+=("$d")
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then
+            echo "::error::init/validate/test failed in: ${failed[*]}"
+            exit 1
+          fi
+
+      - name: tflint
+        if: ${{ !cancelled() }}
+        run: tflint --recursive --config "$PWD/.tflint.hcl" --format compact
+
+      - name: terraform-docs up to date
+        if: ${{ !cancelled() }}
+        env:
+          DIRS: ${{ steps.modules.outputs.dirs }}
+        run: |
+          failed=()
+          for d in $DIRS; do
+            terraform-docs --config "$PWD/.terraform-docs.yml" --output-check "$d" || failed+=("$d")
+          done
+          if (( ${#failed[@]} )); then
+            echo "::error::README.md out of date in: ${failed[*]}. Run: terraform-docs --config .terraform-docs.yml <module dir>"
+            exit 1
+          fi
+
+      - name: trivy (source)
+        if: ${{ !cancelled() }}
+        run: trivy config --config trivy.yaml modules
+
+      - name: Vendored config check
+        if: ${{ !cancelled() }}
+        uses: ./.shared/.github/actions/config-check
+        with:
+          working-directory: .
+          profile: module
+          shared-sha: ${{ job.workflow_sha }}

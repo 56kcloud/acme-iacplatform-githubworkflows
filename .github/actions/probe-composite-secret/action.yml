@@ -1,0 +1,25 @@
+name: probe-composite-secret
+description: Sandbox probe. Prints a transformed secret on purpose; use dummy values.
+inputs:
+  secret-value:
+    required: true
+  multiline-secret-value:
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        VALUE: ${{ inputs.secret-value }}
+        MULTI: ${{ inputs.multiline-secret-value }}
+      run: |
+        echo "direct via env (expect ***): $VALUE"
+        echo "reversed (masking won't catch this): $(rev <<<"$VALUE")"
+        echo "INPUT_* env vars visible in composite steps: $(env | grep -c '^INPUT_' || true)"
+        if [[ -n "$MULTI" ]]; then
+          echo "multiline, line by line (expect each line ***):"
+          while IFS= read -r line; do echo "  > $line"; done <<<"$MULTI"
+        fi
+    - shell: bash
+      run: echo "direct via expression (expect ***): ${{ inputs.secret-value }}"

@@ -1,0 +1,4 @@
+framework:
+  - terraform_plan
+compact: true
+quiet: true

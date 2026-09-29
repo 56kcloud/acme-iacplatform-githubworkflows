@@ -1,0 +1,51 @@
+name: probe-mise
+
+# Sandbox probe; see the deploy README.
+
+on:
+  workflow_call:
+
+jobs:
+  resolve:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-22.04]
+        working_directory: ["", engorg, prodorg]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        env:
+          MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+        with:
+          version: 2026.9.16
+          working_directory: ${{ matrix.working_directory }}
+
+      - name: Resolve from each directory
+        continue-on-error: true
+        shell: bash
+        env:
+          WD: ${{ matrix.working_directory }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          {
+            echo "### $RUNNER_LABEL, mise-action working_directory = \`${WD:-<unset>}\`"
+            echo
+            echo "| step cwd | mise current terraform | terraform on PATH | path |"
+            echo "|---|---|---|---|"
+            for d in . engorg prodorg "$RUNNER_TEMP"; do
+              ( cd "$d" && echo "| \`$d\` | $(mise current terraform 2>&1 | head -1) | $(terraform version -json 2>/dev/null | jq -r .terraform_version || echo 'not found') | \`$(command -v terraform || echo -)\` |" )
+            done
+            echo
+            echo "PATH order (first 6):"
+            echo '```'
+            tr ':' '\n' <<<"$PATH" | head -6
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

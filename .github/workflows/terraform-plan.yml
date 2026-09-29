@@ -1,0 +1,166 @@
+name: terraform-plan
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Top-level env directory; also the environment name.
+        type: string
+        required: true
+      app-id:
+        description: GitHub App that reads this repo and private module sources.
+        type: string
+        required: false
+        default: ""
+      aws-role-arn:
+        description: Role to assume. Empty assumes nothing.
+        type: string
+        required: false
+        default: ""
+      aws-region:
+        type: string
+        required: false
+        default: eu-central-1
+    secrets:
+      app-private-key:
+        required: false
+    outputs:
+      plan-artifact:
+        description: Artifact with tfplan, plan.txt and .terraform.lock.hcl.
+        value: ${{ jobs.plan.outputs.plan-artifact }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # No environment: plans get a non-environment sub claim and never wait for reviewers.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      plan-artifact: ${{ steps.artifact.outputs.name }}
+    concurrency:
+      group: terraform-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: false # the default is true; a cancelled run can leave a state lock
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      # Same bootstrap in all three workflows; composites only exist after the .shared checkout.
+      - name: Validate inputs
+        working-directory: .
+        env:
+          WORKDIR: ${{ inputs.working-directory }}
+          APP_ID: ${{ inputs.app-id }}
+          HAS_KEY: ${{ secrets.app-private-key != '' }}
+          SHARED_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [[ ! "$SHARED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha is empty or malformed ('$SHARED_SHA'); cannot check out this shared repo at its own SHA"
+            exit 1
+          fi
+          if [[ ! "$WORKDIR" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::working-directory must be a top-level directory name (it doubles as the environment name), got '$WORKDIR'"
+            exit 1
+          fi
+          if [[ -z "$APP_ID" || "$HAS_KEY" != true ]]; then
+            echo "::error::app-id input and app-private-key secret are required to read the shared repo"
+            exit 1
+          fi
+
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          # No repositories: list. The token reads whatever the App is installed on.
+          permission-contents: read
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: .shared
+          persist-credentials: false
+
+      - name: OIDC claims
+        uses: ./.shared/.github/actions/oidc-claims
+        with:
+          label: plan (${{ github.event_name }}, no environment)
+
+      - uses: ./.shared/.github/actions/setup-tools
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: AWS credentials
+        if: inputs.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: plan-${{ inputs.working-directory }}-${{ github.run_id }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -diff -recursive
+
+      - name: terraform init
+        env:
+          # The token reaches git via env on this step only. Nothing is written to ~/.gitconfig.
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/${{ github.repository_owner }}/
+          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
+          GIT_CONFIG_VALUE_1: git@github.com:${{ github.repository_owner }}/
+        run: terraform init -no-color
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - id: plan
+        name: terraform plan
+        run: |
+          set -o pipefail
+          terraform plan -no-color -out=tfplan | tee plan.txt
+          terraform show -json tfplan > tfplan.json
+
+      - id: artifact
+        name: Name plan artifact
+        env:
+          NAME: plan-${{ inputs.working-directory }}-${{ github.run_attempt }}
+        run: echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # The lock file travels with the plan: apply inits with -lockfile=readonly.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            ${{ inputs.working-directory }}/tfplan
+            ${{ inputs.working-directory }}/plan.txt
+            ${{ inputs.working-directory }}/.terraform.lock.hcl
+
+      - name: tflint
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
+        run: tflint --config "$PWD/.tflint.hcl" --format compact
+
+      - name: trivy (plan)
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && github.event_name == 'pull_request' }}
+        run: trivy config --config trivy.yaml tfplan.json
+
+      - name: Vendored config check
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: ./.shared/.github/actions/config-check
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          shared-sha: ${{ job.workflow_sha }}

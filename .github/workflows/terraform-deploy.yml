@@ -1,0 +1,155 @@
+name: terraform-deploy
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Top-level env directory; also the environment name.
+        type: string
+        required: true
+      plan-artifact:
+        description: The plan job's plan-artifact output.
+        type: string
+        required: true
+      aws-role-arn:
+        description: Role to assume. Empty assumes nothing.
+        type: string
+        required: false
+        default: ""
+      aws-region:
+        type: string
+        required: false
+        default: eu-central-1
+      app-id:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      app-private-key:
+        required: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ${{ inputs.working-directory }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: terraform-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: false # the default is true; a cancelled run can leave a state lock
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      # A failing step, not a job-level if: a skipped job shows green.
+      - name: Require main
+        working-directory: .
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::apply runs only on refs/heads/main, got $GITHUB_REF ($GITHUB_EVENT_NAME)"
+            exit 1
+          fi
+
+      # Same bootstrap in all three workflows; composites only exist after the .shared checkout.
+      - name: Validate inputs
+        working-directory: .
+        env:
+          WORKDIR: ${{ inputs.working-directory }}
+          APP_ID: ${{ inputs.app-id }}
+          HAS_KEY: ${{ secrets.app-private-key != '' }}
+          SHARED_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [[ ! "$SHARED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha is empty or malformed ('$SHARED_SHA'); cannot check out this shared repo at its own SHA"
+            exit 1
+          fi
+          if [[ ! "$WORKDIR" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::working-directory must be a top-level directory name (it doubles as the environment name), got '$WORKDIR'"
+            exit 1
+          fi
+          if [[ -z "$APP_ID" || "$HAS_KEY" != true ]]; then
+            echo "::error::app-id input and app-private-key secret are required to read the shared repo"
+            exit 1
+          fi
+
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          # No repositories: list. The token reads whatever the App is installed on.
+          permission-contents: read
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: .shared
+          persist-credentials: false
+
+      - name: OIDC claims
+        uses: ./.shared/.github/actions/oidc-claims
+        with:
+          label: apply (${{ github.event_name }}, environment ${{ inputs.working-directory }})
+
+      - uses: ./.shared/.github/actions/setup-tools
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: AWS credentials
+        if: inputs.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: apply-${{ inputs.working-directory }}-${{ github.run_id }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.plan-artifact }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Plan being applied
+        env:
+          ARTIFACT: ${{ inputs.plan-artifact }}
+        run: |
+          {
+            echo "### Applying plan \`$ARTIFACT\`"
+            echo '```'
+            tail -n 60 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: terraform init
+        env:
+          # The token reaches git via env on this step only. Nothing is written to ~/.gitconfig.
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/${{ github.repository_owner }}/
+          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository_owner }}/.insteadOf
+          GIT_CONFIG_VALUE_1: git@github.com:${{ github.repository_owner }}/
+        run: terraform init -no-color -lockfile=readonly
+
+      - name: terraform apply
+        run: |
+          set -o pipefail
+          terraform apply -no-color tfplan | tee apply.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: apply-${{ inputs.working-directory }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: ${{ inputs.working-directory }}/apply.txt

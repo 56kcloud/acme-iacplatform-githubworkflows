@@ -1,0 +1,30 @@
+name: config-check
+description: Fail if vendored configs differ from this repo at the pinned SHA.
+inputs:
+  working-directory:
+    required: true
+  profile:
+    required: false
+    default: deploy
+  shared-dir:
+    description: Path of this shared repo, checked out at shared-sha.
+    required: false
+    default: .shared
+  shared-sha:
+    description: SHA of the running shared workflow (job.workflow_sha).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Compare vendored configs
+      shell: bash
+      env:
+        WORKDIR: ${{ inputs.working-directory }}
+        PROFILE: ${{ inputs.profile }}
+        SHARED_DIR: ${{ inputs.shared-dir }}
+        SHARED_SHA: ${{ inputs.shared-sha }}
+      # Needs Python >= 3.11; runner python3 may be older.
+      run: |
+        mise x python@3.12 -- python3 "$SHARED_DIR/scripts/config_sync.py" check \
+          --env-dir "$WORKDIR" --profile "$PROFILE" \
+          --source-dir "$SHARED_DIR" --expect-sha "$SHARED_SHA"
