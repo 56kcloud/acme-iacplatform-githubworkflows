@@ -148,8 +148,8 @@ gh api -H 'Accept: application/vnd.github.raw' \
   | mise x python@3.12 -- python3 - check --env-dir "${usage_env}"
 """
 
-[tasks."config:pin"]
-description = "Pin an env's deploy stub to a shared-repo tag, then sync its configs"
+[tasks."workflows:pin"]
+description = "Pin an env's workflow stub to a shared-repo tag, then sync its configs"
 usage = '''
 arg "<env>" help="Environment directory, e.g. prod"
 arg "<version>" help="Tag of the shared repo, e.g. v0.1.3"
@@ -171,7 +171,7 @@ Python an empty script and the task passes having done nothing.
 
 ## Updating the pin
 
-`mise run config:pin <env> <version>` resolves the tag to its commit
+`mise run workflows:pin <env> <version>` resolves the tag to its commit
 (branches are refused), rewrites that env's stub to `@<sha> # <tag>`, then
 syncs the env's vendored configs at the new version. Commit the stub and
 configs together in one PR. Pin envs one at a time (devt, then depl, then

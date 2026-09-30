@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 r"""Vendor shared configs at the SHA the caller's stubs pin, or check they match.
 
+pin repins the caller's workflow stub to a tag and then syncs: the vendored
+configs follow the stub's pin, so the two can't be separated.
+
 Run from the caller repo's root. Locally, fetch it from the shared repo's
 default branch; it re-runs itself at the version the stub pins:
 
