@@ -102,53 +102,80 @@ The caller must grant the permissions; a reusable workflow can't raise them.
 `configs/deploy/` (for each env directory of a deploy repo) and
 `configs/module/` (for the root of a module repo) hold `.tflint.hcl`,
 `trivy.yaml`, `.trivyignore`, `.checkov.yml` and `.terraform-docs.yml`.
-Callers commit copies, and the copies follow the SHA their stub pins:
+Callers commit copies, and the copies follow the SHA their stub pins. In a
+deploy repo each env dir follows the SHA of its own stub
+(`deploy-<env>.yml`), so a config change rolls out per env like the workflow
+does. Module stubs are named `ci.yml`.
 
-- Callers vendor with one command from their repo root. No caller-side
-  scripts or tasks are needed: `config_sync.py` is fetched from this repo's
-  default branch, reads the caller's stub, and re-runs itself at the pinned
-  version. Deploy stubs are named `deploy-<env>.yml`; module stubs are named
-  `ci.yml`.
-
-  ```sh
-  # deploy repo, one env (use check instead of sync to verify)
-  gh api -H 'Accept: application/vnd.github.raw' \
-    repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
-    | mise x python@3.12 -- python3 - sync --env-dir prod
-
-  # module repo
-  gh api -H 'Accept: application/vnd.github.raw' \
-    repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
-    | mise x python@3.12 -- python3 - sync --profile module --env-dir .
-  ```
+- A mise task, `config:sync`, copies them from this repo at the pinned SHA. It
+  lives in each caller repo's root `mise.toml`. The task fetches
+  `config_sync.py` from this repo's default branch; the script reads the
+  caller's stub and re-runs itself at the pinned version.
 - Both workflows run `config_sync.py check` directly, not through the caller's
-  task, at `job.workflow_sha`. The check fails when a committed copy differs,
-  ignoring line endings, trailing newlines and file mode. It prints a diff and
-  the command to fix it.
+  task, at `job.workflow_sha`. A drifted copy fails that step, so the check
+  goes red. It ignores line endings, trailing newlines and file mode, and
+  prints a diff and the command to fix it.
 - A file listed in `CONFIG_SKIP` under `[_]` in the caller's `mise.toml` is
   owned by the caller and not checked. trivy's `severity` is an exact list, so
   a local `trivy.yaml` must keep `HIGH` and `CRITICAL`; give the platform team
   CODEOWNERS on these files.
 
-## Updating the pin
+### Caller tasks
 
-One command per env, from the caller repo's root. `pin` resolves the tag to its
-commit (branches are refused), rewrites that env's stub to
-`@<sha> # <tag>`, then syncs the vendored configs at the new version:
+Deploy repo, root `mise.toml` (tasks only; tool versions stay in each env's
+`mise.toml`):
 
-```sh
+```toml
+[tasks."config:sync"]
+description = "Vendor configs/deploy into an env dir at the SHA its stub pins"
+usage = 'arg "<env>" help="Environment directory, e.g. prod"'
+shell = "bash -c"
+run = """
+set -euo pipefail
 gh api -H 'Accept: application/vnd.github.raw' \
   repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
-  | mise x python@3.12 -- python3 - pin --env-dir devt --version v0.1.3
+  | mise x python@3.12 -- python3 - sync --env-dir "${usage_env}"
+"""
 
-# module repo
+[tasks."config:check"]
+description = "Check an env dir's vendored configs match the SHA its stub pins, as CI does"
+usage = 'arg "<env>" help="Environment directory, e.g. prod"'
+shell = "bash -c"
+run = """
+set -euo pipefail
 gh api -H 'Accept: application/vnd.github.raw' \
   repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
-  | mise x python@3.12 -- python3 - pin --profile module --env-dir . --version v0.1.3
+  | mise x python@3.12 -- python3 - check --env-dir "${usage_env}"
+"""
+
+[tasks."config:pin"]
+description = "Pin an env's deploy stub to a shared-repo tag, then sync its configs"
+usage = '''
+arg "<env>" help="Environment directory, e.g. prod"
+arg "<version>" help="Tag of the shared repo, e.g. v0.1.3"
+'''
+shell = "bash -c"
+run = """
+set -euo pipefail
+gh api -H 'Accept: application/vnd.github.raw' \
+  repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
+  | mise x python@3.12 -- python3 - pin --env-dir "${usage_env}" --version "${usage_version}"
+"""
 ```
 
-Commit the stub and configs together in one PR. Pin envs one at a time
-(devt, then depl, then prod) to roll an upgrade through them.
+Module repo: the same three tasks in the root `mise.toml`, with no `<env>`
+argument and `--profile module --env-dir .` in place of `--env-dir`.
+
+`set -euo pipefail` matters: without `pipefail`, a failed download hands
+Python an empty script and the task passes having done nothing.
+
+## Updating the pin
+
+`mise run config:pin <env> <version>` resolves the tag to its commit
+(branches are refused), rewrites that env's stub to `@<sha> # <tag>`, then
+syncs the env's vendored configs at the new version. Commit the stub and
+configs together in one PR. Pin envs one at a time (devt, then depl, then
+prod) to roll an upgrade through them.
 
 ## Changes from the templates
 
