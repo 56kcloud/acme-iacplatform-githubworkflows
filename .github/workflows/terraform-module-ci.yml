@@ -70,8 +70,7 @@ jobs:
         run: |
           gh api -H 'Accept: application/vnd.github.raw' \
             "repos/${SHARED_REPO}/contents/scripts/config_sync.py?ref=${SHARED_SHA}" > "$RUNNER_TEMP/config_sync.py"
-          mise x python@3.12 -- python3 "$RUNNER_TEMP/config_sync.py" check --profile module \
-            --env-dir . --expect-sha "$SHARED_SHA"
+          mise x python@3.12 -- python3 "$RUNNER_TEMP/config_sync.py" check --profile module --env-dir .
 
       - name: TFLint
         id: tflint

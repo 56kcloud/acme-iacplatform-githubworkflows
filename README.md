@@ -108,17 +108,16 @@ deploy repo each env dir follows the SHA of its own stub
 does. Module stubs are named `ci.yml`.
 
 - A mise task, `config:sync`, copies them from this repo at the pinned SHA. It
-  lives in each caller repo's root `mise.toml`. The task fetches
-  `config_sync.py` from this repo's default branch; the script reads the
-  caller's stub and re-runs itself at the pinned version.
+  lives in each caller repo's root `mise.toml` and runs `config_sync.py` from
+  this repo's default branch; the script reads the SHA from the caller's stub.
 - Both workflows run `config_sync.py check` directly, not through the caller's
-  task, at `job.workflow_sha`. A drifted copy fails that step, so the check
-  goes red. It ignores line endings, trailing newlines and file mode, and
-  prints a diff and the command to fix it.
-- A file listed in `CONFIG_SKIP` under `[_]` in the caller's `mise.toml` is
-  owned by the caller and not checked. trivy's `severity` is an exact list, so
-  a local `trivy.yaml` must keep `HIGH` and `CRITICAL`; give the platform team
-  CODEOWNERS on these files.
+  task. A drifted copy fails that step, so the check goes red. Line endings and
+  trailing newlines don't count as drift. It prints a diff and the command to
+  fix it.
+- A file listed in `CONFIG_SKIP` under `[_]` in the env's `mise.toml` (the
+  root `mise.toml` in a module repo) is owned by the caller and not checked.
+  trivy's `severity` is an exact list, so a local `trivy.yaml` must keep
+  `HIGH` and `CRITICAL`; give the platform team CODEOWNERS on these files.
 
 ### Caller tasks
 
