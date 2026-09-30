@@ -17,14 +17,6 @@ on:
         required: false
         type: string
         default: ""
-      aws-region:
-        required: false
-        type: string
-        default: eu-central-2
-      aws-deploy-role:
-        required: false
-        type: string
-        default: acme-github-deploy
     secrets:
       GITHUBMCH_REPOS_READ_APP_PRIVATE_KEY:
         required: true
@@ -40,8 +32,8 @@ concurrency:
 
 env:
   AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
-  AWS_REGION: ${{ inputs.aws-region }}
-  AWS_DEPLOY_ROLE: ${{ inputs.aws-deploy-role }}
+  AWS_REGION: "eu-central-2"
+  AWS_DEPLOY_ROLE: "acme-github-deploy"
   DEPLOY_ENV: ${{ inputs.deploy-env }}
   TF_ACTION: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')) && 'apply' || 'plan' }}
 

@@ -86,8 +86,6 @@ The caller must grant the permissions; a reusable workflow can't raise them.
 | `deploy-env` | required | Environment directory and GitHub environment name |
 | `action` | `plan` | The caller's dispatch input; ignored on push and PR |
 | `aws-account-id` | `""` | Empty skips AWS credentials, for testing without AWS |
-| `aws-region` | `eu-central-2` | |
-| `aws-deploy-role` | `acme-github-deploy` | |
 
 ### Secrets and variables
 
@@ -194,8 +192,8 @@ Deploy only:
   gets its own comment;
 - apply runs only on `main`: a dispatched apply from any other branch fails
   in "Require main for apply", so it can't skip CODEOWNERS review;
-- the AWS account, region and role are inputs, and an empty account skips
-  AWS credentials.
+- the AWS account is an input, and an empty account skips AWS credentials.
+  Region and role stay the template's constants.
 
 ## Known issues, left for the tooling follow-up
 
