@@ -150,33 +150,6 @@ gh api -H 'Accept: application/vnd.github.raw' \
 Commit the stub and configs together in one PR. Pin envs one at a time
 (devt, then depl, then prod) to roll an upgrade through them.
 
-Optional, once an org owner installs the Renovate app: Renovate's
-`github-actions` manager opens these PRs itself. Callers carry a
-`renovate.json` like the one below; without the app it does nothing. If a
-release changes `configs/`, the vendored config check fails on the Renovate
-PR with the sync command in its log; run it on the PR branch and push.
-
-```json
-{
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "enabledManagers": ["github-actions"],
-  "packageRules": [
-    {
-      "matchDepNames": ["ACME-internal/xxx-githubworkflows"],
-      "matchFileNames": [".github/workflows/deploy-devt.yml"],
-      "additionalBranchPrefix": "devt-"
-    },
-    {
-      "matchDepNames": ["ACME-internal/xxx-githubworkflows"],
-      "matchFileNames": [".github/workflows/deploy-prod.yml"],
-      "additionalBranchPrefix": "prod-",
-      "minimumReleaseAge": "3 days"
-    }
-  ]
-}
-```
-
 ## Changes from the templates
 
 Both workflows:
