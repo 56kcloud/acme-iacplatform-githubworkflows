@@ -104,9 +104,23 @@ The caller must grant the permissions; a reusable workflow can't raise them.
 `trivy.yaml`, `.trivyignore`, `.checkov.yml` and `.terraform-docs.yml`.
 Callers commit copies, and the copies follow the SHA their stub pins:
 
-- A caller-side mise task runs `scripts/config_sync.py sync`, fetched at the
-  pinned SHA, to write them. Deploy stubs are named `deploy-<env>.yml`; module
-  stubs are named `ci.yml`.
+- Callers vendor with one command from their repo root. No caller-side
+  scripts or tasks are needed: `config_sync.py` is fetched from this repo's
+  default branch, reads the caller's stub, and re-runs itself at the pinned
+  version. Deploy stubs are named `deploy-<env>.yml`; module stubs are named
+  `ci.yml`.
+
+  ```sh
+  # deploy repo, one env (use check instead of sync to verify)
+  gh api -H 'Accept: application/vnd.github.raw' \
+    repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
+    | mise x python@3.12 -- python3 - sync --env-dir prod
+
+  # module repo
+  gh api -H 'Accept: application/vnd.github.raw' \
+    repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
+    | mise x python@3.12 -- python3 - sync --profile module --env-dir .
+  ```
 - Both workflows run `config_sync.py check` directly, not through the caller's
   task, at `job.workflow_sha`. The check fails when a committed copy differs,
   ignoring line endings, trailing newlines and file mode. It prints a diff and
@@ -115,6 +129,37 @@ Callers commit copies, and the copies follow the SHA their stub pins:
   owned by the caller and not checked. trivy's `severity` is an exact list, so
   a local `trivy.yaml` must keep `HIGH` and `CRITICAL`; give the platform team
   CODEOWNERS on these files.
+
+## Updating the pin
+
+Callers don't repin by hand: Renovate's `github-actions` manager updates
+`uses: …@<sha> # vX.Y.Z` to a new tag's commit, comment included. In a deploy
+repo, one rule per env stub gives each env its own PR, and a release age on
+the later env makes upgrades roll in order:
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["github-actions"],
+  "packageRules": [
+    {
+      "matchDepNames": ["ACME-internal/xxx-githubworkflows"],
+      "matchFileNames": [".github/workflows/deploy-devt.yml"],
+      "additionalBranchPrefix": "devt-"
+    },
+    {
+      "matchDepNames": ["ACME-internal/xxx-githubworkflows"],
+      "matchFileNames": [".github/workflows/deploy-prod.yml"],
+      "additionalBranchPrefix": "prod-",
+      "minimumReleaseAge": "3 days"
+    }
+  ]
+}
+```
+
+If a release changes `configs/`, the vendored config check fails on the
+Renovate PR with the sync command in its log. Run it on the PR branch and push.
 
 ## Changes from the templates
 

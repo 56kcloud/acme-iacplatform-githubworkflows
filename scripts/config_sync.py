@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Vendor shared configs at the SHA the caller's stubs pin, or check they match.
+r"""Vendor shared configs at the SHA the caller's stubs pin, or check they match.
 
-  config_sync.py sync  --env-dir engorg                    # deploy repo, fetches with gh
-  config_sync.py check --env-dir engorg --expect-sha "$SHA"
-  config_sync.py check --profile module --env-dir . --expect-sha "$SHA"
+Run from the caller repo's root. Locally, fetch it from the shared repo's
+default branch; it re-runs itself at the version the stub pins:
+
+  gh api -H 'Accept: application/vnd.github.raw' \
+    repos/<owner>/acme-iacplatform-githubworkflows/contents/scripts/config_sync.py \
+    | mise x python@3.12 -- python3 - sync --env-dir engorg
+
+  config_sync.py sync  --env-dir engorg                    # deploy repo env
+  config_sync.py check --profile module --env-dir .        # module repo
+  config_sync.py check --env-dir engorg --expect-sha "$SHA" # CI, already pinned
   config_sync.py check --env-dir engorg --source-dir ../acme-iacplatform-githubworkflows
 """
 
@@ -15,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # tomllib is stdlib only from 3.11. Fail with a hint rather than an ImportError.
@@ -154,6 +162,28 @@ def shared_files(profile, repo, sha, source_dir):
         raise SyncError(f"fetching configs/{profile} from {repo}@{sha[:12]} failed:\n{e.stderr.strip()}")
 
 
+def reexec_pinned(repo, sha):
+    """Replace this process with config_sync.py from `repo` at `sha`, same arguments.
+
+    Local runs fetch this script from the shared repo's default branch, which
+    can be newer than the version the stub pins. Re-running the pinned copy
+    keeps the checking logic in step with the pinned configs. CONFIG_SYNC_SHA
+    marks the re-run so it doesn't fetch itself again.
+    """
+    try:
+        out = subprocess.run(
+            ["gh", "api", "-H", "Accept: application/vnd.github.raw",
+             f"repos/{repo}/contents/scripts/config_sync.py?ref={sha}"],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise SyncError(f"fetching scripts/config_sync.py from {repo}@{sha[:12]} failed:\n{e.stderr.decode().strip()}")
+    path = Path(tempfile.gettempdir()) / f"config_sync-{sha[:12]}.py"
+    path.write_bytes(out.stdout)
+    os.environ["CONFIG_SYNC_SHA"] = sha
+    os.execv(sys.executable, [sys.executable, str(path), *sys.argv[1:]])
+
+
 def normalise(data):
     """Canonical bytes for comparison: LF line endings, exactly one trailing newline.
 
@@ -189,6 +219,12 @@ def main():
             f"stubs for '{env}' pin {sha[:12]} but the running workflow is {args.expect_sha[:12]}; "
             "the stub parser and the runner disagree about which version is in use"
         )
+
+    # CI passes --expect-sha and already runs the pinned copy; --source-dir
+    # means the caller chose the version. Otherwise make sure the pinned copy
+    # of this script is the one doing the work.
+    if not args.expect_sha and not args.source_dir and os.environ.get("CONFIG_SYNC_SHA") != sha:
+        reexec_pinned(repo, sha)
 
     files = shared_files(args.profile, repo, sha, args.source_dir)
 
