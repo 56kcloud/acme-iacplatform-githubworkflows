@@ -86,23 +86,35 @@ def main():
     repo, ref = pinned_ref(args.env_dir, args.profile)
     skip = config_skip(args.env_dir)
 
-    # Only the shared files are compared; the env dir's own files are ignored.
+    # Walk the shared files only: anything else in the env dir (main.tf,
+    # mise.toml, README.md) belongs to the caller and is never touched.
+    # Every file is visited before failing, so one run reports all drift.
     drifted = 0
     for name, upstream in shared_files(repo, ref, args.profile).items():
         local = args.env_dir / name
+
+        # Listed in CONFIG_SKIP: the caller owns this file, neither written nor checked.
         if name in skip:
             print(f"skip     {local}")
             continue
+
+        # Normalise the shared copy once; both sync and check use this form.
         want = normalise(upstream)
+
         if args.mode == "sync":
+            # Write the normalised form, so a fresh sync always passes check.
             local.write_bytes(want)
             print(f"wrote    {local}")
         elif not local.exists():
             drifted += 1
             print(f"missing  {local}")
         elif normalise(local.read_bytes()) != want:
+            # Normalise the local copy too: a CRLF checkout or an extra blank
+            # line at the end is not drift. Anything else is.
             drifted += 1
             print(f"differs  {local}")
+            # Shared version first, so "-" lines are what the file should say
+            # and "+" lines are the local changes.
             sys.stdout.writelines(difflib.unified_diff(
                 want.decode(errors="replace").splitlines(keepends=True),
                 normalise(local.read_bytes()).decode(errors="replace").splitlines(keepends=True),
