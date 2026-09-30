@@ -148,22 +148,9 @@ gh api -H 'Accept: application/vnd.github.raw' \
   | mise x python@3.12 -- python3 - check --env-dir "${usage_env}"
 """
 
-[tasks."workflows:pin"]
-description = "Pin an env's workflow stub to a shared-repo tag, then sync its configs"
-usage = '''
-arg "<env>" help="Environment directory, e.g. prod"
-arg "<version>" help="Tag of the shared repo, e.g. v0.1.3"
-'''
-shell = "bash -c"
-run = """
-set -euo pipefail
-gh api -H 'Accept: application/vnd.github.raw' \
-  repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
-  | mise x python@3.12 -- python3 - pin --env-dir "${usage_env}" --version "${usage_version}"
-"""
 ```
 
-Module repo: the same three tasks in the root `mise.toml`, with no `<env>`
+Module repo: the same two tasks in the root `mise.toml`, with no `<env>`
 argument and `--profile module --env-dir .` in place of `--env-dir`.
 
 `set -euo pipefail` matters: without `pipefail`, a failed download hands
@@ -171,11 +158,15 @@ Python an empty script and the task passes having done nothing.
 
 ## Updating the pin
 
-`mise run workflows:pin <env> <version>` resolves the tag to its commit
-(branches are refused), rewrites that env's stub to `@<sha> # <tag>`, then
-syncs the env's vendored configs at the new version. Commit the stub and
-configs together in one PR. Pin envs one at a time (devt, then depl, then
-prod) to roll an upgrade through them.
+1. In the env's stub, change the `uses:` line to the new release: the full
+   commit SHA of its tag, and the tag as the comment
+   (`@<sha> # v0.1.4`). `git rev-list -n1 v0.1.4` in this repo gives the SHA.
+2. Run `mise run config:sync <env>` so the env's vendored configs follow.
+3. Commit both in one PR. If step 2 was missed, the vendored config check goes
+   red with the command to fix it.
+
+Pin envs one at a time (devt, then depl, then prod) to roll an upgrade
+through them.
 
 ## Changes from the templates
 
