@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Vendor shared configs at the SHA the caller's stubs pin, or check they match.
 
-  config_sync.py sync  --env-dir engorg
-  config_sync.py check --env-dir engorg --source-dir .shared --expect-sha "$SHA"
-  config_sync.py check --profile module --env-dir . --source-dir .shared --expect-sha "$SHA"
+  config_sync.py sync  --env-dir engorg                    # deploy repo, fetches with gh
+  config_sync.py check --env-dir engorg --expect-sha "$SHA"
+  config_sync.py check --profile module --env-dir . --expect-sha "$SHA"
+  config_sync.py check --env-dir engorg --source-dir ../acme-iacplatform-githubworkflows
 """
 
 import argparse
@@ -16,31 +17,49 @@ import subprocess
 import sys
 from pathlib import Path
 
+# tomllib is stdlib only from 3.11. Fail with a hint rather than an ImportError.
 try:
     import tomllib
 except ModuleNotFoundError:
     sys.exit("config_sync.py needs Python >= 3.11 (try: mise x python@3.12 -- python3 ...)")
 
+# The repo name is fixed; the owner is not, so the same script works in any org.
 SHARED_REPO_NAME = "acme-iacplatform-githubworkflows"
+
+# Which caller workflow files pin the shared repo, per profile. {env} is the
+# env directory's name, so deploy repos have one stub per environment.
 STUBS = {
     "deploy": ("deploy-{env}.yml",),
     "module": ("ci.yml",),
 }
+
+# Matches `uses: <owner>/<shared repo>/.github/workflows/<file>@<ref>` and
+# captures owner/repo and the ref. Other `uses:` lines in the stub are ignored.
 USES_RE = re.compile(
     r"^\s*uses:\s*(?P<repo>[\w.-]+/" + re.escape(SHARED_REPO_NAME) + r")"
     r"/\.github/workflows/[\w.-]+@(?P<ref>\S+)"
 )
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# In Actions, errors are printed as ::error annotations so they show on the PR.
 IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 class SyncError(Exception):
+    """A setup problem that stops the run. Carries a file and line for the annotation."""
+
     def __init__(self, msg, file=None, line=None):
         super().__init__(msg)
         self.file, self.line = file, line
 
 
 def error(msg, file=None, line=None):
+    """Print one error: an annotation in Actions, a plain line elsewhere.
+
+    Only the first line becomes the annotation; any following lines (a diff)
+    are printed as ordinary log output underneath. Everything goes to stdout so
+    errors stay in order with the ok/skip lines.
+    """
     first, *rest = msg.splitlines()
     if IN_ACTIONS:
         loc = ",".join(f"{k}={v}" for k, v in (("file", file), ("line", line)) if v)
@@ -52,7 +71,13 @@ def error(msg, file=None, line=None):
 
 
 def pinned_ref(repo_root, env, profile):
-    """Return (repo, sha) pinned by the caller's stubs, which must all agree."""
+    """Return (repo, sha) pinned by the caller's stubs, which must all agree.
+
+    The pinned SHA is the only source of truth for which configs to vendor, so
+    configs move exactly when the stub is repinned. Every matching `uses:`
+    line is collected, keyed by (file, line), so errors can point at the exact
+    line.
+    """
     names = [n.format(env=env) for n in STUBS[profile]]
     found = {}
     for name in names:
@@ -68,9 +93,12 @@ def pinned_ref(repo_root, env, profile):
             f"no stub for '{env}' calls {SHARED_REPO_NAME} "
             f"(looked for {', '.join('.github/workflows/' + n for n in names)})"
         )
+    # A tag or branch can move after review; only a full commit SHA is fixed.
     for (stub, lineno), (_, ref) in found.items():
         if not SHA_RE.match(ref):
             raise SyncError(f"{stub}:{lineno} pins '@{ref}', not a 40-character commit SHA", stub, lineno)
+    # One version per env: if two lines pin different SHAs there is no single
+    # answer to "which configs", so refuse rather than pick one.
     if len(set(found.values())) > 1:
         lines = "\n".join(f"  {s}:{n}: {r}@{ref}" for (s, n), (r, ref) in found.items())
         (stub, lineno), *_ = found
@@ -79,7 +107,13 @@ def pinned_ref(repo_root, env, profile):
 
 
 def skip_list(repo_root, env_dir):
-    """Map each CONFIG_SKIP entry to the (file, line) that lists it."""
+    """Map each CONFIG_SKIP entry to the (file, line) that lists it.
+
+    CONFIG_SKIP lives under [_] in mise.toml, a table mise itself never reads.
+    Both the repo root and the env directory are read; in a module repo they
+    are the same file, which dict.fromkeys de-duplicates. The line of the
+    CONFIG_SKIP key is kept so a bad entry can be annotated in place.
+    """
     skip = {}
     for cfg in dict.fromkeys((repo_root / "mise.toml", env_dir / "mise.toml")):
         if cfg.exists():
@@ -91,12 +125,19 @@ def skip_list(repo_root, env_dir):
 
 
 def gh_json(path):
+    """Call the GitHub REST API through the gh CLI (GH_TOKEN in CI, the user's login locally)."""
     out = subprocess.run(["gh", "api", path], check=True, capture_output=True, text=True)
     return json.loads(out.stdout)
 
 
 def shared_files(profile, repo, sha, source_dir):
-    """Map filename -> bytes for configs/<profile>/ at the pinned SHA."""
+    """Map filename -> bytes for configs/<profile>/ at the pinned SHA.
+
+    With --source-dir, read a local checkout (the caller must have it at the
+    right SHA). Otherwise fetch through the API at exactly `sha`, so nothing
+    from the shared repo is checked out into the caller's workspace, where
+    fmt, Trivy and Checkov would scan it.
+    """
     if source_dir:
         base = source_dir / "configs" / profile
         if not base.is_dir():
@@ -114,6 +155,11 @@ def shared_files(profile, repo, sha, source_dir):
 
 
 def normalise(data):
+    """Canonical bytes for comparison: LF line endings, exactly one trailing newline.
+
+    A CRLF checkout or an extra blank line at the end is not drift. An empty
+    file stays empty. File mode is never compared.
+    """
     data = data.replace(b"\r\n", b"\n").rstrip(b"\n")
     return data + b"\n" if data else b""
 
@@ -128,12 +174,15 @@ def main():
     ap.add_argument("--expect-sha", help="fail unless the stubs pin this SHA (CI passes job.workflow_sha)")
     args = ap.parse_args()
 
+    # The env directory's name is the env name, used to find deploy-<env>.yml.
     repo_root = args.repo_root.resolve()
     env_dir = (repo_root / args.env_dir).resolve()
     env = env_dir.name
     if not env_dir.is_dir():
         raise SyncError(f"env directory {args.env_dir} does not exist")
 
+    # In CI, job.workflow_sha is what GitHub is actually running. If the stub
+    # parse disagrees, the parser is wrong, and the check must not pass on it.
     repo, sha = pinned_ref(repo_root, env, args.profile)
     if args.expect_sha and args.expect_sha != sha:
         raise SyncError(
@@ -142,11 +191,17 @@ def main():
         )
 
     files = shared_files(args.profile, repo, sha, args.source_dir)
+
+    # A skip entry that matches nothing is almost always a typo (trivy.yml for
+    # trivy.yaml); failing stops it silently skipping nothing.
     skip = skip_list(repo_root, env_dir)
     unknown = sorted(skip.keys() - files.keys())
     if unknown:
         raise SyncError(f"CONFIG_SKIP names files the shared repo does not provide: {', '.join(unknown)}", *skip[unknown[0]])
 
+    # Walk the shared set only. Files that exist locally but not upstream
+    # (main.tf, mise.toml, a README) are the caller's and are ignored. Each file
+    # is all-or-nothing: vendored verbatim, or skipped and owned locally.
     problems = 0
     for name, upstream in files.items():
         local = env_dir / name
@@ -156,6 +211,7 @@ def main():
             continue
         want = normalise(upstream)
         if args.mode == "sync":
+            # Write the normalised form, so a fresh sync always passes check.
             local.write_bytes(want)
             local.chmod(0o644)
             print(f"wrote    {rel}")
@@ -169,11 +225,15 @@ def main():
                 normalise(local.read_bytes()).decode(errors="replace").splitlines(),
                 f"{repo}@{sha[:12]}:configs/{args.profile}/{name}", str(rel), lineterm="", n=1,
             ))
+            # The first hunk header's "+N" is the first changed line in the
+            # local file: annotate there so it lands on the PR diff.
             hunk = next((re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", d) for d in diff if d.startswith("@@")), None)
             error(f"{rel} differs from {repo}@{sha[:12]}\n" + "\n".join(diff[:40]), str(rel), hunk and hunk.group(1))
         else:
             print(f"ok       {rel}")
 
+    # Report every mismatch before failing, with both ways out. A module repo
+    # vendors to its root, so the hint drops the env argument there.
     if problems:
         is_root = env_dir == repo_root
         task = "mise run config:sync" + ("" if is_root else f" {env}")
@@ -189,6 +249,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Setup problems (bad stub, bad CONFIG_SKIP, fetch failure) raise SyncError
+    # and exit 1 with one annotated error; file mismatches exit 1 from main().
     try:
         sys.exit(main())
     except SyncError as e:
