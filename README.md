@@ -132,10 +132,29 @@ Callers commit copies, and the copies follow the SHA their stub pins:
 
 ## Updating the pin
 
-Callers don't repin by hand: Renovate's `github-actions` manager updates
-`uses: …@<sha> # vX.Y.Z` to a new tag's commit, comment included. In a deploy
-repo, one rule per env stub gives each env its own PR, and a release age on
-the later env makes upgrades roll in order:
+One command per env, from the caller repo's root. `pin` resolves the tag to its
+commit (branches are refused), rewrites that env's stub to
+`@<sha> # <tag>`, then syncs the vendored configs at the new version:
+
+```sh
+gh api -H 'Accept: application/vnd.github.raw' \
+  repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
+  | mise x python@3.12 -- python3 - pin --env-dir devt --version v0.1.3
+
+# module repo
+gh api -H 'Accept: application/vnd.github.raw' \
+  repos/ACME-internal/xxx-githubworkflows/contents/scripts/config_sync.py \
+  | mise x python@3.12 -- python3 - pin --profile module --env-dir . --version v0.1.3
+```
+
+Commit the stub and configs together in one PR. Pin envs one at a time
+(devt, then depl, then prod) to roll an upgrade through them.
+
+Optional, once an org owner installs the Renovate app: Renovate's
+`github-actions` manager opens these PRs itself. Callers carry a
+`renovate.json` like the one below; without the app it does nothing. If a
+release changes `configs/`, the vendored config check fails on the Renovate
+PR with the sync command in its log; run it on the PR branch and push.
 
 ```json
 {
@@ -157,9 +176,6 @@ the later env makes upgrades roll in order:
   ]
 }
 ```
-
-If a release changes `configs/`, the vendored config check fails on the
-Renovate PR with the sync command in its log. Run it on the PR branch and push.
 
 ## Changes from the templates
 

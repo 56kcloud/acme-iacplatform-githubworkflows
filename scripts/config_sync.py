@@ -8,6 +8,7 @@ default branch; it re-runs itself at the version the stub pins:
     repos/<owner>/acme-iacplatform-githubworkflows/contents/scripts/config_sync.py \
     | mise x python@3.12 -- python3 - sync --env-dir engorg
 
+  config_sync.py pin   --env-dir engorg --version v0.1.2   # repin the stub, then sync
   config_sync.py sync  --env-dir engorg                    # deploy repo env
   config_sync.py check --profile module --env-dir .        # module repo
   config_sync.py check --env-dir engorg --expect-sha "$SHA" # CI, already pinned
@@ -132,10 +133,17 @@ def skip_list(repo_root, env_dir):
     return skip
 
 
+def gh(*args):
+    """Run `gh api ...` and return stdout bytes (GH_TOKEN in CI, the user's login locally)."""
+    try:
+        return subprocess.run(["gh", "api", *args], check=True, capture_output=True).stdout
+    except FileNotFoundError:
+        raise SyncError("needs the GitHub CLI (gh), logged in with read access to the shared repo")
+
+
 def gh_json(path):
-    """Call the GitHub REST API through the gh CLI (GH_TOKEN in CI, the user's login locally)."""
-    out = subprocess.run(["gh", "api", path], check=True, capture_output=True, text=True)
-    return json.loads(out.stdout)
+    """Call the GitHub REST API through the gh CLI and parse the JSON reply."""
+    return json.loads(gh(path))
 
 
 def shared_files(profile, repo, sha, source_dir):
@@ -159,11 +167,13 @@ def shared_files(profile, repo, sha, source_dir):
             if e["type"] == "file"
         }
     except subprocess.CalledProcessError as e:
-        raise SyncError(f"fetching configs/{profile} from {repo}@{sha[:12]} failed:\n{e.stderr.strip()}")
+        raise SyncError(f"fetching configs/{profile} from {repo}@{sha[:12]} failed:\n{e.stderr.decode().strip()}")
 
 
-def reexec_pinned(repo, sha):
-    """Replace this process with config_sync.py from `repo` at `sha`, same arguments.
+def reexec_pinned(repo, sha, argv=None):
+    """Replace this process with config_sync.py from `repo` at `sha`.
+
+    Runs with the same arguments unless `argv` is given (pin hands over to sync).
 
     Local runs fetch this script from the shared repo's default branch, which
     can be newer than the version the stub pins. Re-running the pinned copy
@@ -171,17 +181,43 @@ def reexec_pinned(repo, sha):
     marks the re-run so it doesn't fetch itself again.
     """
     try:
-        out = subprocess.run(
-            ["gh", "api", "-H", "Accept: application/vnd.github.raw",
-             f"repos/{repo}/contents/scripts/config_sync.py?ref={sha}"],
-            check=True, capture_output=True,
-        )
+        script = gh("-H", "Accept: application/vnd.github.raw", f"repos/{repo}/contents/scripts/config_sync.py?ref={sha}")
     except subprocess.CalledProcessError as e:
         raise SyncError(f"fetching scripts/config_sync.py from {repo}@{sha[:12]} failed:\n{e.stderr.decode().strip()}")
     path = Path(tempfile.gettempdir()) / f"config_sync-{sha[:12]}.py"
-    path.write_bytes(out.stdout)
+    path.write_bytes(script)
     os.environ["CONFIG_SYNC_SHA"] = sha
-    os.execv(sys.executable, [sys.executable, str(path), *sys.argv[1:]])
+    # execv replaces the process, dropping anything still in the stdout buffer.
+    sys.stdout.flush()
+    os.execv(sys.executable, [sys.executable, str(path), *(sys.argv[1:] if argv is None else argv)])
+
+
+def resolve_tag(repo, version):
+    """Return the commit SHA of tag `version` in `repo`. Branches are refused: they move."""
+    try:
+        refs = gh_json(f"repos/{repo}/git/matching-refs/tags/{version}")
+        if not any(r["ref"] == f"refs/tags/{version}" for r in refs):
+            raise SyncError(f"{repo} has no tag '{version}'")
+        # commits/<tag> peels annotated tags down to the commit they point at.
+        return gh_json(f"repos/{repo}/commits/{version}")["sha"]
+    except subprocess.CalledProcessError as e:
+        raise SyncError(f"looking up tag '{version}' in {repo} failed:\n{e.stderr.decode().strip()}")
+
+
+def repin_stubs(repo_root, env, profile, sha, version):
+    """Rewrite every `uses:` line that calls the shared repo to `@<sha> # <version>`."""
+    for name in (n.format(env=env) for n in STUBS[profile]):
+        stub = repo_root / ".github" / "workflows" / name
+        if not stub.exists():
+            continue
+        lines = stub.read_text().splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if USES_RE.match(line):
+                # Replace from the @ to the end of the line: the old ref and any
+                # old version comment go together.
+                lines[i] = re.sub(r"@\S+.*$", f"@{sha} # {version}", line.rstrip("\n")) + "\n"
+                print(f"pinned   {stub.relative_to(repo_root)}:{i + 1} to {version} ({sha[:12]})")
+        stub.write_text("".join(lines))
 
 
 def normalise(data):
@@ -196,12 +232,13 @@ def normalise(data):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["sync", "check"])
+    ap.add_argument("mode", choices=["sync", "check", "pin"])
     ap.add_argument("--env-dir", required=True, type=Path)
     ap.add_argument("--profile", default="deploy", choices=["deploy", "module"])
     ap.add_argument("--repo-root", default=Path("."), type=Path)
     ap.add_argument("--source-dir", type=Path, help="shared repo checkout at the pinned SHA; default fetches with gh")
     ap.add_argument("--expect-sha", help="fail unless the stubs pin this SHA (CI passes job.workflow_sha)")
+    ap.add_argument("--version", help="pin: tag of the shared repo to pin, e.g. v0.1.2")
     args = ap.parse_args()
 
     # The env directory's name is the env name, used to find deploy-<env>.yml.
@@ -219,6 +256,20 @@ def main():
             f"stubs for '{env}' pin {sha[:12]} but the running workflow is {args.expect_sha[:12]}; "
             "the stub parser and the runner disagree about which version is in use"
         )
+
+    # pin: point the stub at the tag's commit, then hand over to that version's
+    # sync so the vendored configs follow the new pin in the same run. The
+    # current stub must already pin the shared repo; that's where the owner
+    # and repo name come from.
+    if args.mode == "pin":
+        if not args.version:
+            raise SyncError("pin needs --version, e.g. --version v0.1.2")
+        if args.source_dir or args.expect_sha:
+            raise SyncError("pin fetches from the shared repo; it doesn't take --source-dir or --expect-sha")
+        new_sha = resolve_tag(repo, args.version)
+        repin_stubs(repo_root, env, args.profile, new_sha, args.version)
+        sync_argv = ["sync", "--env-dir", str(args.env_dir), "--profile", args.profile, "--repo-root", str(args.repo_root)]
+        reexec_pinned(repo, new_sha, sync_argv)
 
     # CI passes --expect-sha and already runs the pinned copy; --source-dir
     # means the caller chose the version. Otherwise make sure the pinned copy
